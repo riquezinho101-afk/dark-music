@@ -331,14 +331,133 @@ function openAudioDB(){ return new Promise((resolve,reject)=>{ const req=indexed
 async function storeAudioFile(key,file){ const db=await openAudioDB(); await new Promise((resolve,reject)=>{ const tx=db.transaction(DB_STORE,'readwrite'); tx.objectStore(DB_STORE).put({key,file}); tx.oncomplete=resolve; tx.onerror=()=>reject(tx.error); tx.onabort=()=>reject(tx.error); }); db.close(); }
 async function deleteStoredAudio(key){ try{ const db=await openAudioDB(); await new Promise((resolve,reject)=>{ const tx=db.transaction(DB_STORE,'readwrite'); tx.objectStore(DB_STORE).delete(key); tx.oncomplete=resolve; tx.onerror=()=>reject(tx.error); }); db.close(); }catch(e){} }
 async function loadStoredAudio(){ const db=await openAudioDB(); const items=await new Promise((resolve,reject)=>{ const tx=db.transaction(DB_STORE,'readonly'); const req=tx.objectStore(DB_STORE).getAll(); req.onsuccess=()=>resolve(req.result||[]); req.onerror=()=>reject(req.error); }); db.close(); return items; }
+/* Cache de metadados (titulo, artista, capa, duracao) em um banco separado.
+   O banco de audio acima NAO e alterado: musicas antigas continuam intactas e, se nao tiverem cache, sao
+   processadas em segundo plano na primeira abertura e salvas aqui para as proximas. */
+const META_DB='darkmusic-meta', META_STORE='meta', META_V=1;
+let metaDBp=null;
+function metaDB(){
+  if(!metaDBp){
+    metaDBp=new Promise((resolve,reject)=>{
+      const req=indexedDB.open(META_DB,1);
+      req.onupgradeneeded=()=>{ if(!req.result.objectStoreNames.contains(META_STORE)) req.result.createObjectStore(META_STORE,{keyPath:'key'}); };
+      req.onsuccess=()=>{ const db=req.result; db.onversionchange=()=>{ db.close(); metaDBp=null; }; resolve(db); };
+      req.onerror=()=>reject(req.error);
+    });
+    metaDBp.catch(()=>{ metaDBp=null; });
+  }
+  return metaDBp;
+}
+async function loadStoredMeta(){
+  const db=await metaDB();
+  const list=await new Promise((resolve,reject)=>{ const req=db.transaction(META_STORE,'readonly').objectStore(META_STORE).getAll(); req.onsuccess=()=>resolve(req.result||[]); req.onerror=()=>reject(req.error); });
+  return new Map(list.map(r=>[r.key,r]));
+}
+const metaBuf=new Map(); let metaT=0;
+function queueMetaPut(rec){ metaBuf.set(rec.key,rec); if(!metaT) metaT=setTimeout(flushMeta,1500); if(metaBuf.size>=40) flushMeta(); }
+async function flushMeta(){
+  clearTimeout(metaT); metaT=0; if(!metaBuf.size) return;
+  const recs=[...metaBuf.values()]; metaBuf.clear();
+  try{
+    const db=await metaDB();
+    await new Promise((resolve,reject)=>{ const tx=db.transaction(META_STORE,'readwrite'), st=tx.objectStore(META_STORE); recs.forEach(r=>st.put(r)); tx.oncomplete=resolve; tx.onerror=tx.onabort=()=>reject(tx.error); });
+  }catch(e){}
+}
+async function deleteStoredMeta(key){
+  metaBuf.delete(key);
+  try{ const db=await metaDB(); db.transaction(META_STORE,'readwrite').objectStore(META_STORE).delete(key); }catch(e){}
+}
+async function patchMetaDur(t){
+  if(!t.key||t.key.startsWith('demo|')) return;
+  try{
+    const db=await metaDB(), st=db.transaction(META_STORE,'readwrite').objectStore(META_STORE), r=st.get(t.key);
+    r.onsuccess=()=>{ const m=r.result; if(m&&m.v===META_V){ m.dur=t.dur; st.put(m); } };
+  }catch(e){}
+}
+document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='hidden') flushMeta(); });
+window.addEventListener('pagehide',()=>{ flushMeta(); });
+
+const tick=()=>new Promise(r=>setTimeout(r,0));
+let refT=0, lastTouch=0;
+['touchstart','touchmove','pointerdown','wheel','scroll'].forEach(ev=>window.addEventListener(ev,()=>{ lastTouch=Date.now(); },{passive:true,capture:true}));
+// Atualiza a lista em lotes e sem mexer nela enquanto o usuario esta tocando/rolando.
+function scheduleRefresh(){
+  if(refT) return;
+  const run=()=>{
+    if(Date.now()-lastTouch<400){ refT=setTimeout(run,300); return; }
+    refT=0; refreshLib();
+  };
+  refT=setTimeout(run,700);
+}
+function refreshLib(){
+  renderLib(); renderPlaylists(); if(S.view==='pld') renderDetail(); markRows();
+  const t=curTrack(); if(t&&t._chg){ t._chg=false; syncAll(); mediaSession(); }
+}
+function setSK(t){ t.sk=norm(t.title+' '+t.artist+' '+t.name); }
+function applyMeta(t,m){
+  const g=guessNames(t.name);
+  t.title=m.title||g.title; t.artist=m.artist||g.artist||'Artista desconhecido';
+  if(m.coverBlob&&!t.realCover){ t.cover=URL.createObjectURL(m.coverBlob); t.realCover=true; }
+  setSK(t); if(S.cur===t.id) t._chg=true;
+}
+
+// Restauracao rapida: mostra a biblioteca assim que os arquivos sao lidos do IndexedDB.
+// Metadados em cache sao aplicados na hora; o restante e processado depois, em segundo plano.
 async function restoreAudioFiles(){
-  let items=[]; try{ items=await loadStoredAudio(); }catch(e){ toast('Não foi possível acessar o armazenamento de músicas.'); return; }
-  let restored=0;
+  S.restoring=true;
+  let items=[], metas=new Map();
+  try{
+    [items,metas]=await Promise.all([ loadStoredAudio(), loadStoredMeta().catch(()=>new Map()) ]);
+  }catch(e){ S.restoring=false; renderAll(); toast('Não foi possível acessar o armazenamento de músicas.'); return; }
+  const pending=[]; let restored=0;
   for(const item of items){
     const f=item.file; if(!f||!isAudio(f)||S.byKey.has(item.key)) continue;
-    try{ const meta=await readID3(f), g=guessNames(f.name), url=URL.createObjectURL(f), dur=await getDur(url); if(dur<0){URL.revokeObjectURL(url);continue;} addTrack({key:item.key,title:meta.title||g.title,artist:meta.artist||g.artist,url,cover:meta.cover,realCover:!!meta.cover,dur,name:f.name}); restored++; }catch(e){}
+    try{
+      const m=metas.get(item.key), ok=!!m&&m.v===META_V&&m.size===f.size&&m.id3===true, g=guessNames(f.name);
+      const cb=ok&&m.cover instanceof Blob?m.cover:null;
+      const t=addTrack({key:item.key,title:(ok&&m.title)||g.title,artist:(ok&&m.artist)||g.artist,url:URL.createObjectURL(f),cover:cb?URL.createObjectURL(cb):null,realCover:!!cb,dur:ok&&m.dur>0?m.dur:0,name:f.name});
+      restored++;
+      if(!ok||!(m.dur>0)) pending.push({t,f,m:ok?m:null});
+    }catch(e){}
   }
+  S.restoring=false;
+  renderAll();
   if(restored) toast(`${plural(restored,'música recuperada','músicas recuperadas')} da biblioteca.`);
+  if(pending.length){ pending.sort((a,b)=>a.t.title.localeCompare(b.t.title,'pt')); enrichTracks(pending).catch(()=>{}); }
+}
+async function enrichOne({t,f,m}){
+  if(!S.byId.has(t.id)) return;
+  const rec=m?{...m}:{key:t.key,v:META_V,id3:true,size:f.size,title:'',artist:'',cover:null,dur:0};
+  if(!m){
+    let id3={}; try{ id3=await readID3(f); }catch(e){}
+    if(!S.byId.has(t.id)) return;
+    rec.title=id3.title||''; rec.artist=id3.artist||''; rec.cover=id3.coverBlob||null;
+    applyMeta(t,{title:rec.title,artist:rec.artist,coverBlob:rec.cover});
+    scheduleRefresh();
+  }
+  let d=t.dur>0?t.dur:await getDur(t.url);
+  if(d<0&&S.byId.has(t.id)) d=await getDur(t.url);
+  if(!S.byId.has(t.id)) return;
+  if(d<0){
+    // arquivo ilegivel: some da lista como antes, mas continua guardado no banco
+    if(S.cur!==t.id&&!S.queue.includes(t.id)) removeTrack(t.id,true);
+    return;
+  }
+  if(d>0){ t.dur=d; rec.dur=d; scheduleRefresh(); }
+  queueMetaPut(rec);
+}
+// Pool pequeno de tarefas: nunca bloqueia a interface nem a reproducao.
+async function enrichTracks(pending){
+  let i=0; S.scan={done:0,total:pending.length};
+  const worker=async()=>{
+    while(i<pending.length){
+      const p=pending[i++];
+      try{ await enrichOne(p); }catch(e){}
+      S.scan.done++; await tick();
+    }
+  };
+  await Promise.all([worker(),worker()]);
+  S.scan=null; flushMeta(); clearTimeout(refT); refT=0; refreshLib();
 }
 let uid=0;
 
@@ -375,7 +494,7 @@ function parseAPIC(d,v2){
   else if(img[0]===0x47&&img[1]===0x49) mime='image/gif';
   else if(img[0]===0x52&&img[1]===0x49) mime='image/webp';
   if(!mime) return null;
-  return URL.createObjectURL(new Blob([img.slice()],{type:mime}));
+  return new Blob([img.slice()],{type:mime});
 }
 async function readID3(file){
   const head=new Uint8Array(await file.slice(0,10).arrayBuffer());
@@ -394,7 +513,7 @@ async function readID3(file){
     const d=b.subarray(s,e);
     if(id==='TIT2'||id==='TT2') out.title=decText(d);
     else if(id==='TPE1'||id==='TP1') out.artist=decText(d);
-    else if((id==='APIC'||id==='PIC')&&!out.cover) out.cover=parseAPIC(d,ver===2);
+    else if((id==='APIC'||id==='PIC')&&!out.coverBlob) out.coverBlob=parseAPIC(d,ver===2);
     p=e;
   }
   return out;
@@ -405,11 +524,11 @@ function guessNames(name){
   return m?{artist:m[1].trim(),title:m[2].trim()}:{artist:'',title:base||name};
 }
 const isAudio=f=>/^audio\//.test(f.type)||/\.(mp3|m4a|aac|ogg|oga|opus|wav|flac|weba)$/i.test(f.name);
-function getDur(url){
+function getDur(url,ms=6000){
   return new Promise(res=>{
     const a=new Audio(); a.preload='metadata';
     const done=v=>{ clearTimeout(to); a.onloadedmetadata=a.onerror=null; a.removeAttribute('src'); res(v); };
-    const to=setTimeout(()=>done(0),6000);
+    const to=setTimeout(()=>done(0),ms);
     a.onloadedmetadata=()=>done(isFinite(a.duration)?a.duration:0);
     a.onerror=()=>done(-1);
     a.src=url;
@@ -459,7 +578,7 @@ async function addDemos(){
 /* ---------- biblioteca ---------- */
 function addTrack(o){
   const t={id:'t'+(++uid),key:o.key,title:o.title,artist:o.artist||'Artista desconhecido',url:o.url,cover:o.cover||genCover(o.key),realCover:!!o.realCover,dur:o.dur||0,name:o.name||o.title};
-  S.tracks.push(t); S.byId.set(t.id,t); S.byKey.set(t.key,t); return t;
+  setSK(t); S.tracks.push(t); S.byId.set(t.id,t); S.byKey.set(t.key,t); return t;
 }
 async function addFiles(list){
   const files=[...list]; if(!files.length) return;
@@ -472,10 +591,10 @@ async function addFiles(list){
     toast(`Lendo ${i+1} de ${files.length}…`,true);
     let meta={}; try{ meta=await readID3(f); }catch(e){}
     const url=URL.createObjectURL(f), dur=await getDur(url);
-    if(dur<0){ URL.revokeObjectURL(url); if(meta.cover) URL.revokeObjectURL(meta.cover); bad++; continue; }
-    const g=guessNames(f.name);
-    addTrack({key,title:meta.title||g.title,artist:meta.artist||g.artist,url,cover:meta.cover,realCover:!!meta.cover,dur,name:f.name});
-    try{ await storeAudioFile(key,f); }catch(e){ toast('Música adicionada, mas não foi possível salvá-la para a próxima abertura.'); }
+    if(dur<0){ URL.revokeObjectURL(url); bad++; continue; }
+    const g=guessNames(f.name), cover=meta.coverBlob?URL.createObjectURL(meta.coverBlob):null;
+    addTrack({key,title:meta.title||g.title,artist:meta.artist||g.artist,url,cover,realCover:!!cover,dur,name:f.name});
+    try{ await storeAudioFile(key,f); queueMetaPut({key,v:META_V,id3:true,size:f.size,title:meta.title||'',artist:meta.artist||'',cover:meta.coverBlob||null,dur:dur>0?dur:0}); }catch(e){ toast('Música adicionada, mas não foi possível salvá-la para a próxima abertura.'); }
     added++;
   }
   renderAll();
@@ -484,10 +603,11 @@ async function addFiles(list){
   if(bad) parts.push(plural(bad,'arquivo não pôde ser lido','arquivos não puderam ser lidos'));
   toast(parts.join(' · ')||'Nada novo para adicionar.');
 }
+const COLL=new Intl.Collator('pt');
 function visibleTracks(){
   const q=norm(S.q.trim());
-  let l=S.tracks.slice().sort((a,b)=>a.title.localeCompare(b.title,'pt'));
-  if(q) l=l.filter(t=>norm(t.title+' '+t.artist+' '+t.name).includes(q));
+  let l=S.tracks.slice().sort((a,b)=>COLL.compare(a.title,b.title));
+  if(q) l=l.filter(t=>t.sk.includes(q));
   return l;
 }
 const isFav=key=>S.pl[0].keys.includes(key);
@@ -506,6 +626,7 @@ function rowHTML(t,ctx){
 function renderLib(){
   const list=visibleTracks(), el=$('#libList'), meta=$('#libMeta');
   $('#qClear').hidden=!S.q;
+  if(!S.tracks.length&&S.restoring){ meta.textContent='Carregando biblioteca…'; el.innerHTML=''; return; }
   if(!S.tracks.length){
     meta.textContent='Biblioteca vazia';
     el.innerHTML=`<div class="empty"><div class="empty-ic">${ic('note')}</div><h3>Sua biblioteca está vazia</h3><p>Escolha arquivos de áudio do celular. Nada é enviado para a internet: tudo toca direto do aparelho.</p><label class="btn primary" for="file">Selecionar músicas</label><button class="btn" data-act="demo">Gerar faixas de demonstração</button></div>`;
@@ -513,7 +634,7 @@ function renderLib(){
   }
   if(!list.length){ meta.textContent='0 resultados'; el.innerHTML=`<div class="empty"><p>Nenhuma faixa encontrada para “${esc(S.q.trim())}”.</p></div>`; return; }
   const total=list.reduce((a,t)=>a+t.dur,0);
-  meta.textContent=S.q?plural(list.length,'resultado','resultados'):`${plural(list.length,'faixa','faixas')} · ${fmt(total)}`;
+  meta.textContent=(S.q?plural(list.length,'resultado','resultados'):`${plural(list.length,'faixa','faixas')} · ${fmt(total)}`)+(S.scan?` · lendo detalhes ${S.scan.done}/${S.scan.total}`:'');
   el.innerHTML=list.map(t=>rowHTML(t,'lib')).join('');
 }
 function renderPlaylists(){
@@ -599,10 +720,10 @@ au.addEventListener('ended',()=>{
   if(i<0){ S.playing=false; au.currentTime=0; syncPlay(); syncTime(); } else go(i);
 });
 au.addEventListener('timeupdate',syncTime);
-au.addEventListener('loadedmetadata',()=>{ const t=curTrack(); if(t&&isFinite(au.duration)&&au.duration>0) t.dur=au.duration; syncTime(); });
+au.addEventListener('loadedmetadata',()=>{ const t=curTrack(); if(t&&isFinite(au.duration)&&au.duration>0){ const old=t.dur; t.dur=au.duration; if(!(old>0)||Math.abs(old-t.dur)>1) patchMetaDur(t); } syncTime(); });
 au.addEventListener('error',()=>{ if(au.getAttribute('src')) onPlayErr(); });
 
-function removeTrack(id){
+function removeTrack(id,keepStored){
   const t=S.byId.get(id); if(!t) return;
   const wasCur=S.cur===id;
   S.tracks=S.tracks.filter(x=>x.id!==id); S.byId.delete(id); S.byKey.delete(t.key);
@@ -610,9 +731,9 @@ function removeTrack(id){
   if(wasCur){ au.pause(); au.removeAttribute('src'); au.load(); S.cur=null; S.qi=-1; S.playing=false; hidePlayer(); }
   else S.qi=S.queue.indexOf(S.cur);
   if(t.url.startsWith('blob:')) URL.revokeObjectURL(t.url);
-  if(!t.key.startsWith('demo|')) deleteStoredAudio(t.key);
+  if(!keepStored&&!t.key.startsWith('demo|')){ deleteStoredAudio(t.key); deleteStoredMeta(t.key); }
   if(t.realCover) URL.revokeObjectURL(t.cover);
-  renderAll();
+  if(keepStored) scheduleRefresh(); else renderAll();
 }
 
 /* ---------- sincronizacao da interface ---------- */
@@ -869,7 +990,7 @@ document.addEventListener('click',e=>{
 /* ---------- inicio ---------- */
 $('#vol').value=S.vol;
 setView('lib');
-restoreAudioFiles().finally(()=>renderAll());
+restoreAudioFiles().catch(()=>{}).finally(()=>{ S.restoring=false; renderAll(); });
 if('serviceWorker' in navigator && (location.protocol==='https:' || location.hostname==='localhost')) navigator.serviceWorker.register('./service-worker.js').catch(()=>{});
 })();
 </script>
