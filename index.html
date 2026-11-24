@@ -216,7 +216,7 @@ input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;bac
     <section id="v-pl" class="view" aria-label="Playlists" hidden>
       <div class="view-head">
         <h2>Playlists</h2>
-        <div class="head-actions"><button class="pill" data-act="auto-organize">✨ Organizar + capas</button><button class="pill" data-act="new-pl"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"/></svg>Nova</button></div>
+        <div class="head-actions"><button class="pill" data-act="auto-organize">✨ Organizar gêneros</button><button class="pill" data-act="new-pl"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"/></svg>Nova</button></div>
       </div>
       <div class="scroll" id="plList"></div>
     </section>
@@ -508,36 +508,43 @@ async function addFiles(list){
   toast(parts.join(' · ')||'Nada novo para adicionar.');
 }
 const AUTO_GENRES=[
-  {id:'funk',name:'🔥 FUNK',terms:['funk','funk carioca','baile funk','funk paulista','mandela','putaria']},
+  {id:'funk',name:'🔥 FUNK',terms:['funk','funk carioca','baile funk','funk paulista','mandela']},
   {id:'sertanejo',name:'🤠 SERTANEJO',terms:['sertanejo','sertanejo universitario','sertanejo raiz','moda de viola','country']},
   {id:'trap',name:'🎧 TRAP',terms:['trap','plug','drill']},
   {id:'rap',name:'🎤 RAP / HIP-HOP',terms:['rap','hip hop','hip-hop','boom bap']},
   {id:'pagode',name:'🥁 PAGODE / SAMBA',terms:['pagode','samba','samba-enredo']},
   {id:'forro',name:'🪗 FORRÓ',terms:['forro','piseiro','xote','baião','baiao']},
-  {id:'gospel',name:'🙏 GOSPEL',terms:['gospel','louvor','adoração','adoracao','worship','christian']},
-  {id:'eletronica',name:'⚡ ELETRÔNICA',terms:['eletronica','electronic','house','techno',' trance','edm','deep house','phonk']},
-  {id:'pop',name:'🎶 POP',terms:['pop','k-pop','j-pop']},
-  {id:'rock',name:'🎸 ROCK',terms:['rock','metal','punk','grunge','indie rock']},
-  {id:'mpb',name:'🇧🇷 MPB / BRASILIDADES',terms:['mpb','bossa nova','musica brasileira','música brasileira']},
-  {id:'reggae',name:'🌴 REGGAE',terms:['reggae','dancehall','ska']}
+  {id:'gospel',name:'🙏 GOSPEL',terms:['gospel','louvor','adoração','adoracao','worship','christian','religious']},
+  {id:'eletronica',name:'⚡ ELETRÔNICA',terms:['eletronica','electronic','house','techno','trance','edm','deep house','phonk','dubstep','trance']},
+  {id:'pop',name:'🎶 POP',terms:['pop','k-pop','j-pop','dance pop','synth-pop']},
+  {id:'rock',name:'🎸 ROCK',terms:['rock','metal','punk','grunge','indie rock','hard rock','alternative rock']},
+  {id:'mpb',name:'🇧🇷 MPB / BRASILIDADES',terms:['mpb','bossa nova','musica brasileira','brazilian','pagode brasileiro']},
+  {id:'reggae',name:'🌴 REGGAE',terms:['reggae','dancehall','ska','dub']},
+  {id:'jazz',name:'🎷 JAZZ',terms:['jazz','smooth jazz','bebop','swing']},
+  {id:'blues',name:'🎸 BLUES',terms:['blues']},
+  {id:'classica',name:'🎻 MÚSICA CLÁSSICA',terms:['classical','classica','orchestra','orchestral','opera','ópera']},
+  {id:'latina',name:'💃 LATINA',terms:['latin','latina','reggaeton','salsa','bachata','merengue','cumbia','regional mexicano']},
+  {id:'indie',name:'🌙 INDIE / ALTERNATIVA',terms:['indie','alternative','alternativa']},
+  {id:'lofi',name:'☁️ LO-FI / AMBIENT',terms:['lo-fi','lofi','ambient','chillout','chill out','downtempo']},
+  {id:'soundtrack',name:'🎬 TRILHAS SONORAS',terms:['soundtrack','trilha sonora','film score','video game','game music']}
 ];
+function hasGenreTerm(value,term){
+  const v=' '+norm(value).replace(/[^a-z0-9]+/g,' ')+' ';
+  const q=' '+norm(term).replace(/[^a-z0-9]+/g,' ').trim()+' ';
+  return q.length>2 && v.includes(q);
+}
 function classifyTrack(t){
-  const genre=norm(t.genre||'');
+  const genre=String(t.genre||'').trim();
   if(genre){
-    const map=[
-      ['funk',['funk','baile funk']],['sertanejo',['sertanejo']],['trap',['trap','drill']],
-      ['rap',['rap','hip hop','hip-hop']],['pagode',['pagode','samba']],['forro',['forro','piseiro','xote','baiao']],
-      ['gospel',['gospel','christian','worship','louvor']],['eletronica',['electronic','eletronica','dance','house','techno','edm','phonk']],
-      ['pop',['pop']],['rock',['rock','metal','punk','grunge']],['mpb',['mpb','brazilian','bossa nova']],['reggae',['reggae','dancehall','ska']]
-    ];
-    for(const [id,terms] of map) if(terms.some(q=>genre.includes(norm(q)))) return AUTO_GENRES.find(g=>g.id===id)||null;
+    // Primeiro procura correspondência mais específica para evitar que subgêneros
+    // sejam classificados por uma palavra genérica.
+    const ordered=AUTO_GENRES.flatMap(g=>g.terms.map(term=>({g,term}))).sort((a,b)=>b.term.length-a.term.length);
+    for(const item of ordered) if(hasGenreTerm(genre,item.term)) return item.g;
   }
-  // Só usa nome/arquivo como pista quando contém um gênero explícito.
-  const text=norm([t.name,t.title].filter(Boolean).join(' '));
-  for(const g of AUTO_GENRES){
-    const hits=g.terms.filter(term=>{ const q=norm(term).trim(); return q.length>3 && new RegExp('(^|[^a-z0-9])'+q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+'([^a-z0-9]|$)').test(text); });
-    if(hits.length) return g;
-  }
+  // Nome do arquivo e título só são usados quando mencionam explicitamente um gênero.
+  const text=[t.name,t.title].filter(Boolean).join(' ');
+  const ordered=AUTO_GENRES.flatMap(g=>g.terms.map(term=>({g,term}))).sort((a,b)=>b.term.length-a.term.length);
+  for(const item of ordered) if(hasGenreTerm(text,item.term)) return item.g;
   return null;
 }
 function organizeTracks(showToast=true){
@@ -623,11 +630,13 @@ async function autoCoverTracks(list,showToast=true){
   return {found,total:pending.length};
 }
 async function autoOrganizeAndCovers(){
-  const org=organizeTracks(false); renderAll();
+  organizeTracks(false); renderAll();
   const missing=S.tracks.filter(t=>!t.realCover||!t.genre);
   const result=await autoCoverTracks(missing,false);
+  // Recalcula depois das consultas online, pois elas também podem descobrir o gênero.
+  const org=organizeTracks(false);
   renderAll();
-  toast(`Playlists organizadas · ${result.found} capa(s) encontrada(s) · ${org.unknown} sem gênero identificado.`);
+  toast(`Gêneros organizados · ${org.moved} música(s) distribuída(s) · ${org.unknown} sem gênero identificado${result.found?` · ${result.found} capa(s) encontrada(s)`:''}.`);
 }
 
 function visibleTracks(){
