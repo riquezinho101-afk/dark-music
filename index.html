@@ -319,8 +319,59 @@ const S={
 };
 if(!S.pl.find(p=>p.id==='fav')) S.pl.unshift({id:'fav',name:'Favoritas',keys:[]});
 else S.pl.sort((a,b)=>(b.id==='fav')-(a.id==='fav'));
-function save(){ try{ localStorage.setItem(LS,JSON.stringify({pl:S.pl,vol:S.vol,shuffle:S.shuffle,repeat:S.repeat,titles:S.titles||{}})); }catch(e){} }
+function save(){ try{ localStorage.setItem(LS,JSON.stringify({pl:S.pl,vol:S.vol,shuffle:S.shuffle,repeat:S.repeat,titles:S.titles||{}})); }catch(e){ console.warn('Não foi possível salvar as preferências',e); } }
 let uid=0;
+
+/* ---------- biblioteca persistente (arquivos de áudio no aparelho) ---------- */
+let libraryDBPromise;
+function openLibraryDB(){
+  if(!('indexedDB' in window)) return Promise.reject(new Error('Este navegador não oferece armazenamento local'));
+  if(!libraryDBPromise) libraryDBPromise=new Promise((resolve,reject)=>{
+    const req=indexedDB.open('darkmusic-library',1);
+    req.onupgradeneeded=()=>{ const db=req.result; if(!db.objectStoreNames.contains('tracks')) db.createObjectStore('tracks',{keyPath:'key'}); };
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error||new Error('Falha ao abrir a biblioteca'));
+  });
+  return libraryDBPromise;
+}
+async function persistTrack(t,blob){
+  const db=await openLibraryDB();
+  return new Promise((resolve,reject)=>{
+    const tx=db.transaction('tracks','readwrite');
+    tx.objectStore('tracks').put({key:t.key,blob,title:t.title,artist:t.artist,genre:t.genre,dur:t.dur,name:t.name});
+    tx.oncomplete=resolve; tx.onerror=()=>reject(tx.error); tx.onabort=()=>reject(tx.error);
+  });
+}
+async function deletePersistedTrack(key){
+  try{ const db=await openLibraryDB(); await new Promise((resolve,reject)=>{ const tx=db.transaction('tracks','readwrite'); tx.objectStore('tracks').delete(key); tx.oncomplete=resolve; tx.onerror=()=>reject(tx.error); tx.onabort=()=>reject(tx.error); }); }
+  catch(e){ console.warn('Não foi possível excluir o arquivo salvo',e); }
+}
+async function updatePersistedTrack(t){
+  try{
+    const db=await openLibraryDB();
+    await new Promise((resolve,reject)=>{
+      const tx=db.transaction('tracks','readwrite'), store=tx.objectStore('tracks'), req=store.get(t.key);
+      req.onsuccess=()=>{ if(req.result){ const record=req.result; Object.assign(record,{title:t.title,artist:t.artist,genre:t.genre,dur:t.dur,name:t.name}); store.put(record); } };
+      req.onerror=()=>reject(req.error); tx.oncomplete=resolve; tx.onerror=()=>reject(tx.error); tx.onabort=()=>reject(tx.error);
+    });
+  }catch(e){ console.warn('Não foi possível atualizar os dados salvos da faixa',e); }
+}
+async function restoreLibrary(){
+  try{
+    const db=await openLibraryDB();
+    const records=await new Promise((resolve,reject)=>{ const tx=db.transaction('tracks','readonly'), req=tx.objectStore('tracks').getAll(); req.onsuccess=()=>resolve(req.result||[]); req.onerror=()=>reject(req.error); });
+    let restored=0;
+    for(const r of records){
+      if(!r||!r.key||!r.blob||S.byKey.has(r.key)) continue;
+      const url=URL.createObjectURL(r.blob);
+      let meta={}; try{ meta=await readID3(r.blob); }catch(e){}
+      const t=addTrack({key:r.key,title:r.title||meta.title||r.name,artist:r.artist||meta.artist,genre:r.genre||meta.genre,dur:r.dur||0,name:r.name||r.title,url,cover:meta.cover,realCover:!!meta.cover});
+      await loadCustomCover(t);
+      restored++;
+    }
+    if(restored){ organizeTracks(false); renderAll(); toast(`${plural(restored,'música recuperada','músicas recuperadas')} da biblioteca salva.`); }
+  }catch(e){ console.warn('Não foi possível recuperar a biblioteca salva',e); toast('Não consegui recuperar as músicas salvas neste navegador.'); }
+}
 
 /* ---------- capas personalizadas (salvas no aparelho) ---------- */
 let coverDBPromise;
@@ -471,8 +522,10 @@ async function addDemos(){
   let n=0;
   for(const d of DEMOS){
     const key='demo|'+d.title; if(S.byKey.has(key)) continue;
-    const url=URL.createObjectURL(synthWav(d));
-    addTrack({key,title:d.title,artist:'DARK MUSIC Labs',url,cover:genCover(key),dur:d.dur,name:d.title+'.wav'});
+    const blob=synthWav(d);
+    const demoUrl=URL.createObjectURL(blob);
+    const track=addTrack({key,title:d.title,artist:'DARK MUSIC Labs',url:demoUrl,cover:genCover(key),dur:d.dur,name:d.title+'.wav'});
+    try{ await persistTrack(track,blob); }catch(e){ console.warn('Faixa demo não foi persistida',e); }
     n++; await new Promise(r=>setTimeout(r,0));
   }
   renderAll(); toast(n?`${plural(n,'faixa gerada','faixas geradas')}. Toque em uma para ouvir.`:'As faixas de demonstração já estão na biblioteca.');
@@ -498,6 +551,8 @@ async function addFiles(list){
     const g=guessNames(f.name);
     const track=addTrack({key,title:meta.title||g.title,artist:meta.artist||g.artist,url,cover:meta.cover,realCover:!!meta.cover,dur,name:f.name,genre:meta.genre||''});
     await loadCustomCover(track);
+    try{ await persistTrack(track,f); }
+    catch(e){ console.warn('Faixa adicionada apenas nesta sessão; não foi possível salvá-la',e); }
     newTracks.push(track);
     added++;
   }
@@ -628,7 +683,9 @@ async function autoCoverTracks(list,showToast=true){
     found+=results.filter(Boolean).length; done+=batch.length;
     if(showToast) toast(`Buscando capas: ${done}/${pending.length} · ${found} encontradas`,true);
   }
-  organizeTracks(false); renderAll();
+  organizeTracks(false);
+  await Promise.all(S.tracks.map(updatePersistedTrack));
+  renderAll();
   if(showToast) toast(`${found} capa(s) encontrada(s). As não localizadas continuam com a capa padrão.`);
   return {found,total:pending.length};
 }
@@ -765,6 +822,8 @@ function removeTrack(id){
   const t=S.byId.get(id); if(!t) return;
   const wasCur=S.cur===id;
   S.tracks=S.tracks.filter(x=>x.id!==id); S.byId.delete(id); S.byKey.delete(t.key);
+  for(const pl of S.pl) pl.keys=pl.keys.filter(k=>k!==t.key);
+  save(); deletePersistedTrack(t.key);
   S.queue=S.queue.filter(x=>x!==id);
   if(wasCur){ au.pause(); au.removeAttribute('src'); au.load(); S.cur=null; S.qi=-1; S.playing=false; hidePlayer(); }
   else S.qi=S.queue.indexOf(S.cur);
@@ -940,7 +999,7 @@ function saveTrackTitle(){
   const t=S.menu&&S.byId.get(S.menu.id), input=$('#trackTitle');
   if(!t||!input) return;
   const title=input.value.trim(); if(!title){toast('Digite um nome para a música.');input.focus();return;}
-  t.title=title; S.titles[t.key]=title; organizeTracks(false); save();
+  t.title=title; S.titles[t.key]=title; organizeTracks(false); save(); updatePersistedTrack(t);
   if(S.cur===t.id) syncAll();
   renderAll(); closeSheet(); toast('Nome atualizado e gênero reorganizado!');
 }
@@ -1053,6 +1112,7 @@ document.addEventListener('click',e=>{
 $('#vol').value=S.vol;
 setView('lib');
 renderAll();
+restoreLibrary();
 })();
 </script>
 
