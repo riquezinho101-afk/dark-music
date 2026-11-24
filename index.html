@@ -1105,7 +1105,7 @@ document.addEventListener('click',e=>{
     case 'm-rm-pl': if(S.menu&&S.menu.ctx){ const t=S.byId.get(S.menu.id); if(t){ const pid=S.menu.ctx.slice(3); const i=S.pl.find(p=>p.id===pid); if(i&&i.keys.includes(t.key)) toggleMember(pid,t.key); } closeSheet(); } break;
     case 'm-rm-lib': if(S.menu){ removeTrack(S.menu.id); closeSheet(); toast('Removida da biblioteca'); } break;
     case 'sheet-close': closeSheet(); break;
-  }
+  
 });
 
 /* ---------- inicio ---------- */
