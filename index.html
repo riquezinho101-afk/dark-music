@@ -74,6 +74,9 @@ body.is-playing .row.cur .eq b:nth-child(3){animation-delay:-600ms}
 .row-txt strong,.row-txt small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .row-txt small{color:var(--mute);font-size:12.5px}
 .row-dur{color:var(--mute);font:500 12.5px var(--display);font-variant-numeric:tabular-nums;letter-spacing:.04em}
+.row-edit{width:36px;height:42px;display:grid;place-items:center;color:var(--neon);opacity:.85;flex:none;border-radius:9px}
+.row-edit:active{background:rgba(34,184,255,.13)}
+.row-edit svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 
 /* playlists */
 .pl-card{width:100%;display:flex;align-items:center;gap:14px;padding:8px 6px;min-height:68px;text-align:left;border-radius:12px;border-bottom:1px solid var(--line)}
@@ -307,7 +310,7 @@ const LS='darkmusic.v1';
 function readSaved(){ try{ return JSON.parse(localStorage.getItem(LS))||{}; }catch(e){ return {}; } }
 const saved=readSaved();
 const S={
-  tracks:[], byId:new Map(), byKey:new Map(),
+  tracks:[], byId:new Map(), byKey:new Map(), titles:saved.titles&&typeof saved.titles==='object'?saved.titles:{},
   queue:[], qi:-1, cur:null, playing:false, open:false,
   shuffle:!!saved.shuffle, repeat:[0,1,2].includes(saved.repeat)?saved.repeat:0,
   vol:Number.isFinite(saved.vol)?Math.min(100,Math.max(0,saved.vol)):80, muted:false,
@@ -316,7 +319,7 @@ const S={
 };
 if(!S.pl.find(p=>p.id==='fav')) S.pl.unshift({id:'fav',name:'Favoritas',keys:[]});
 else S.pl.sort((a,b)=>(b.id==='fav')-(a.id==='fav'));
-function save(){ try{ localStorage.setItem(LS,JSON.stringify({pl:S.pl,vol:S.vol,shuffle:S.shuffle,repeat:S.repeat})); }catch(e){} }
+function save(){ try{ localStorage.setItem(LS,JSON.stringify({pl:S.pl,vol:S.vol,shuffle:S.shuffle,repeat:S.repeat,titles:S.titles||{}})); }catch(e){} }
 let uid=0;
 
 /* ---------- capas personalizadas (salvas no aparelho) ---------- */
@@ -477,7 +480,7 @@ async function addDemos(){
 
 /* ---------- biblioteca ---------- */
 function addTrack(o){
-  const t={id:'t'+(++uid),key:o.key,title:o.title,artist:o.artist||'Artista desconhecido',url:o.url,cover:o.cover||genCover(o.key),realCover:!!o.realCover,dur:o.dur||0,name:o.name||o.title,genre:o.genre||''};
+  const t={id:'t'+(++uid),key:o.key,title:S.titles[o.key]||o.title,artist:o.artist||'Artista desconhecido',url:o.url,cover:o.cover||genCover(o.key),realCover:!!o.realCover,dur:o.dur||0,name:o.name||o.title,genre:o.genre||''};
   S.tracks.push(t); S.byId.set(t.id,t); S.byKey.set(t.key,t); return t;
 }
 async function addFiles(list){
@@ -655,6 +658,7 @@ function rowHTML(t,ctx){
       <span class="row-txt"><strong>${esc(t.title)}</strong><small>${esc(t.artist)}</small></span>
       <span class="row-dur">${fmt(t.dur)}</span>
     </button>
+    <button class="row-edit" data-act="edit-title" data-id="${t.id}" aria-label="Editar nome de ${esc(t.title)}" title="Editar nome"><svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z"/></svg></button>
     <button class="icon-btn" data-act="menu-track" data-id="${t.id}" data-ctx="${ctx}" aria-label="Mais opções de ${esc(t.title)}">${ic('more')}</button>
   </div>`;
 }
@@ -926,6 +930,21 @@ function closeSheet(){
   const w=$('#sheetWrap'); w.classList.remove('on');
   sheetTimer=setTimeout(()=>{ w.hidden=true; $('#sheetBody').innerHTML=''; },200);
 }
+function editTrackTitle(id){
+  const t=S.byId.get(id); if(!t) return;
+  S.menu={id,ctx:'edit'};
+  openSheet(`<h3 class="s-title">Editar nome da música</h3><p class="s-sub">Você pode acrescentar o gênero ao nome, por exemplo: (Sertanejo).</p><input class="field" id="trackTitle" maxlength="140" value="${esc(t.title)}" placeholder="Nome da música" autocomplete="off" enterkeyhint="done" aria-label="Nome da música"><div class="s-actions"><button class="btn" data-act="sheet-close">Cancelar</button><button class="btn primary" data-act="title-save">Salvar</button></div>`);
+  setTimeout(()=>{const i=$('#trackTitle'); if(i){i.focus();i.setSelectionRange(i.value.length,i.value.length);}},260);
+}
+function saveTrackTitle(){
+  const t=S.menu&&S.byId.get(S.menu.id), input=$('#trackTitle');
+  if(!t||!input) return;
+  const title=input.value.trim(); if(!title){toast('Digite um nome para a música.');input.focus();return;}
+  t.title=title; S.titles[t.key]=title; organizeTracks(false); save();
+  if(S.cur===t.id) syncAll();
+  renderAll(); closeSheet(); toast('Nome atualizado e gênero reorganizado!');
+}
+
 function trackMenu(id,ctx){
   const t=S.byId.get(id); if(!t) return;
   S.menu={id,ctx}; const fav=isFav(t.key); let rm;
@@ -962,6 +981,7 @@ function createFromSheet(forId){
 }
 $('#sheetBody').addEventListener('keydown',e=>{
   if(e.key==='Enter'&&e.target.id==='plName'){ e.preventDefault(); const b=$('#sheetBody [data-act="pl-create"]'); createFromSheet(b?b.dataset.id:''); }
+  if(e.key==='Enter'&&e.target.id==='trackTitle'){ e.preventDefault(); saveTrackTitle(); }
 });
 
 /* ---------- toast ---------- */
@@ -992,6 +1012,8 @@ document.addEventListener('click',e=>{
     case 'close-player': closePlayer(); break;
     case 'play-track': playList(queueFor(ctx),id); break;
     case 'menu-track': trackMenu(id,ctx); break;
+    case 'edit-title': editTrackTitle(id); break;
+    case 'title-save': saveTrackTitle(); break;
     case 'menu-current': if(S.cur) trackMenu(S.cur,'player'); break;
     case 'toggle-play': togglePlay(); break;
     case 'next': next(); break;
